@@ -30,12 +30,10 @@ class Plexer(object):
 
     def pop_buffer(self, addr):
         with self:
-            b = self.out_queues.setdefault(addr)
+            b = self.out_queues.setdefault(addr, [])
             if b:
                 self.out_queues[addr] = []
-                return b
-            else:
-                return []
+            return b
 
     def __enter__(self):
         self.lock.acquire()
@@ -76,8 +74,11 @@ def conf_socket(s):
     s.setblocking(1)
     s.settimeout(.1)
 
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
 def conf_connection(c):
-    conf_socket(c)
+    c.setblocking(1)
+    c.settimeout(.1)
 
     c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     c.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
@@ -143,9 +144,10 @@ def accept(port, inbound, outbound):
             p.start()
 
     try:
-        sock.shutdown(socket.SHUT_RDWR)
-    except socket.error:
-        pass
+        sock.close()
+        logging.debug("%s: socket closed" % t.name)
+    except socket.error, e:
+        logging.debug(e, exc_info=1)
 
 def term_handler(signum, framee):
     logging.debug("Terminating by %s" % signum)
@@ -166,27 +168,37 @@ def main(db_path, air_port, gcs_port):
     airplex.pop_buffer('db')
     gcsplex.pop_buffer('db')
 
-    t = threading.Thread(target=accept, name="air_accept",
+    t_air = threading.Thread(target=accept, name="air_accept",
                          args=[air_port, airplex, gcsplex])
-    t.daemon = True
-    t.start()
+    t_air.daemon = True
+    t_air.start()
 
-    t = threading.Thread(target=accept, name="gcs_accept",
+    t_gcs = threading.Thread(target=accept, name="gcs_accept",
                          args=[gcs_port, gcsplex, airplex])
-    t.daemon = True
-    t.start()
+    t_gcs.daemon = True
+    t_gcs.start()
 
-    while _running:
-        time.sleep(.1)
+    def flush_db():
+        now = int(time.time())
         for st, plex in [(SOURCE_TYPE.AIR, airplex),
                          (SOURCE_TYPE.GCS, gcsplex)]:
             queue = plex.pop_buffer('db')
             if queue:
                 db.executemany("INSERT INTO packets (timestamp, source_type, source_address, data) VALUES (?, ?, ?, ?)",
-                               [(int(time.time()), st, addr, data)
-                                for data, (addr, port) in queue])
+                               [(now, st, "%s:%d" % addr, data)
+                                for data, addr in queue])
+
+    while _running:
+        time.sleep(.1)
+        flush_db()
+
+    t_air.join()
+    t_gcs.join()
+    flush_db()
 
     db.close()
+
+    logging.debug("Clean shutdown")
 
 if __name__ == '__main__':
     if len(sys.argv) < 4:
