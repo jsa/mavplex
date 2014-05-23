@@ -67,7 +67,6 @@ def forever(fn):
             except Exception, e:
                 logging.exception(e)
                 logging.error("Exception in thread %s" % t.name)
-                break
         logging.debug("%s: finished" % t.name)
     return wrapper
 
