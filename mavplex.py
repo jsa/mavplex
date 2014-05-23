@@ -24,11 +24,12 @@ class Plexer(object):
             self.out_queues.pop(addr, None)
 
     def recv(self, data, *args):
+        now = time.time()
         with self:
             for queue in self.out_queues.itervalues():
-                queue.append((data,) + args)
+                queue.append((data, now) + args)
 
-    def pop_buffer(self, addr):
+    def pop_queue(self, addr):
         with self:
             b = self.out_queues.setdefault(addr, [])
             if b:
@@ -49,7 +50,7 @@ def init_db(db_path):
                db.execute("SELECT name FROM SQLITE_MASTER")):
         db.execute("CREATE TABLE packets"
                    " (id INTEGER PRIMARY KEY ASC,"
-                   "  timestamp INTEGER NOT NULL,"
+                   "  timestamp STRING NOT NULL,"
                    "  source_type INTEGER NOT NULL,"
                    "  source_address TEXT NOT NULL,"
                    "  data BLOB NOT NULL)")
@@ -78,7 +79,8 @@ def conf_socket(s):
 
 def conf_connection(c):
     c.setblocking(1)
-    c.settimeout(.1)
+    # <= 10ms latency
+    c.settimeout(.01)
 
     c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     c.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
@@ -93,18 +95,23 @@ def conf_connection(c):
 @forever
 def pipe(addr, conn, inbound, outbound):
     t = threading.current_thread()
+    buf = bytearray(2 ** 16)
+
+    def sum(args):
+        """Built-in version sucks. :p"""
+        return reduce(lambda x, y: x + y, args)
 
     def recvsend():
         try:
-            data = conn.recv(4096)
+            size = conn.recv_into(buf)
         except socket.timeout:
             pass
         else:
-            if data:
-                inbound.recv(data, addr)
-        outbuf = outbound.pop_buffer(addr)
-        if outbuf:
-            conn.send("".join(x[0] for x in outbuf))
+            if size:
+                inbound.recv(buf[:size], addr)
+        queue = outbound.pop_queue(addr)
+        if queue:
+            conn.send(sum(x[0] for x in queue))
 
     while _running:
         try:
@@ -165,8 +172,8 @@ def main(db_path, air_port, gcs_port):
     airplex, gcsplex = Plexer(), Plexer()
 
     # initialize buffers
-    airplex.pop_buffer('db')
-    gcsplex.pop_buffer('db')
+    airplex.pop_queue('db')
+    gcsplex.pop_queue('db')
 
     t_air = threading.Thread(target=accept, name="air_accept",
                          args=[air_port, airplex, gcsplex])
@@ -179,14 +186,16 @@ def main(db_path, air_port, gcs_port):
     t_gcs.start()
 
     def flush_db():
-        now = int(time.time())
-        for st, plex in [(SOURCE_TYPE.AIR, airplex),
-                         (SOURCE_TYPE.GCS, gcsplex)]:
-            queue = plex.pop_buffer('db')
+        for source, plex in [(SOURCE_TYPE.AIR, airplex),
+                             (SOURCE_TYPE.GCS, gcsplex)]:
+            queue = plex.pop_queue('db')
             if queue:
-                db.executemany("INSERT INTO packets (timestamp, source_type, source_address, data) VALUES (?, ?, ?, ?)",
-                               [(now, st, "%s:%d" % addr, data)
-                                for data, addr in queue])
+                try:
+                    db.executemany("INSERT INTO packets (timestamp, source_type, source_address, data) VALUES (?, ?, ?, ?)",
+                                   [(ts, source, "%s:%d" % addr, str(buf))
+                                    for buf, ts, addr in queue])
+                except sqlite3.Error, e:
+                    logging.warn(e, exc_info=1)
 
     while _running:
         time.sleep(.1)
