@@ -1,12 +1,12 @@
 from collections import namedtuple
 import logging
+import signal
 import socket
 import sqlite3
+import struct
 import sys
 import threading
 import time
-import signal
-import struct
 
 
 SOURCE_TYPE = namedtuple('SourceType', ('AIR', 'GCS'))(1, 2)
@@ -14,7 +14,7 @@ SOURCE_TYPE = namedtuple('SourceType', ('AIR', 'GCS'))(1, 2)
 _running = False
 
 
-class Plexer(object):
+class Perplex(object):
     def __init__(self):
         self.lock = threading.RLock()
         self.out_queues = {}
@@ -56,7 +56,7 @@ def init_db(db_path):
                    "  data BLOB NOT NULL)")
     return db
 
-def forever(fn):
+def stayin_alive(fn):
     def wrapper(*args):
         t = threading.current_thread()
         logging.debug("%s: started" % t.name)
@@ -66,7 +66,8 @@ def forever(fn):
                 break
             except Exception, e:
                 logging.exception(e)
-                logging.error("Exception in thread %s" % t.name)
+                logging.error("%s: restarting on exception" % t.name)
+                time.sleep(1)
         logging.debug("%s: finished" % t.name)
     return wrapper
 
@@ -78,29 +79,29 @@ def conf_socket(s):
 
 def conf_connection(c):
     c.setblocking(1)
-    # <= 10ms latency
-    c.settimeout(.01)
+    c.settimeout(.01) # <= 10ms latency
 
-    c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1) # doge is keep-alive
     c.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
 
-    c.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2048)
-    c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+    # unsure about this in relation to recv buffer...
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2**13)
+    c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2**13)
     c.setsockopt(socket.SOL_SOCKET, socket.SO_SNDLOWAT, 1)
     c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
     c.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", 5, 0))
     c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, struct.pack("ll", 5, 0))
 
-@forever
+@stayin_alive
 def pipe(addr, conn, inbound, outbound):
     t = threading.current_thread()
-    buf = bytearray(2 ** 16)
+    buf = bytearray(2**16)
 
     def sum(args):
         """Built-in version sucks. :p"""
         return reduce(lambda x, y: x + y, args)
 
-    def recvsend():
+    def so_internet():
         try:
             size = conn.recv_into(buf)
         except socket.timeout:
@@ -114,10 +115,10 @@ def pipe(addr, conn, inbound, outbound):
 
     while _running:
         try:
-            recvsend()
+            so_internet()
         except socket.error, e:
-            logging.exception(e)
-            logging.warn("%s: socket error, closing" % t.name)
+            logging.info(e, exc_info=1)
+            logging.info("%s: socket error, closing" % t.name)
             break
 
     try:
@@ -127,7 +128,7 @@ def pipe(addr, conn, inbound, outbound):
 
     outbound.closed(addr)
 
-@forever
+@stayin_alive
 def accept(port, inbound, outbound):
     t = threading.current_thread()
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -154,8 +155,9 @@ def accept(port, inbound, outbound):
         logging.debug("%s: socket closed" % t.name)
     except socket.error, e:
         logging.debug(e, exc_info=1)
+        logging.debug("%s: socket.close exception" % t.name)
 
-def term_handler(signum, framee):
+def fml(signum, framee):
     logging.debug("Terminating by %s" % signum)
     global _running
     _running = False
@@ -165,22 +167,22 @@ def main(db_path, air_port, gcs_port):
     _running = True
 
     db = init_db(db_path)
-    signal.signal(signal.SIGTERM, term_handler)
-    signal.signal(signal.SIGINT, term_handler)
+    signal.signal(signal.SIGTERM, fml)
+    signal.signal(signal.SIGINT, fml)
 
-    airplex, gcsplex = Plexer(), Plexer()
+    airplex, gcsplex = Perplex(), Perplex()
 
     # initialize buffers
     airplex.pop_queue('db')
     gcsplex.pop_queue('db')
 
     t_air = threading.Thread(target=accept, name="air_accept",
-                         args=[air_port, airplex, gcsplex])
+                             args=[air_port, airplex, gcsplex])
     t_air.daemon = True
     t_air.start()
 
     t_gcs = threading.Thread(target=accept, name="gcs_accept",
-                         args=[gcs_port, gcsplex, airplex])
+                             args=[gcs_port, gcsplex, airplex])
     t_gcs.daemon = True
     t_gcs.start()
 
@@ -195,18 +197,19 @@ def main(db_path, air_port, gcs_port):
                                     for buf, ts, addr in queue])
                 except sqlite3.Error, e:
                     logging.warn(e, exc_info=1)
+                    logging.warn("Database write failed")
 
     while _running:
         time.sleep(.1)
         flush_db()
 
+    logging.debug("Shutting down...")
     t_air.join()
     t_gcs.join()
     flush_db()
-
     db.close()
-
     logging.debug("Clean shutdown")
+
 
 if __name__ == '__main__':
     if len(sys.argv) < 4:
