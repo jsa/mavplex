@@ -46,6 +46,7 @@ class Perplex(object):
 def init_db(db_path):
     db = sqlite3.connect(db_path,
                          isolation_level=None) # autocommit
+    db.text_factory = str
     if not any(table == "packets" for (table,) in
                db.execute("SELECT name FROM SQLITE_MASTER")):
         db.execute("CREATE TABLE packets"
@@ -87,8 +88,8 @@ def conf_connection(c):
     # unsure about this in relation to recv buffer...
     c.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2**13)
     c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2**13)
-    c.setsockopt(socket.SOL_SOCKET, socket.SO_SNDLOWAT, 1)
-    c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
+    #c.setsockopt(socket.SOL_SOCKET, socket.SO_SNDLOWAT, 1)
+    #c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVLOWAT, 1)
     c.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", 5, 0))
     c.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, struct.pack("ll", 5, 0))
 
